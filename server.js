@@ -172,7 +172,8 @@ app.post('/bot/signal', async (req, res) => {
     const target    = new Date(now.getTime() + EXPMIN * 60 * 1000);
     const expiryStr = String(target.getHours()).padStart(2,'0') + ':' + String(target.getMinutes()).padStart(2,'0');
     const data      = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
-    const prompt    = `Kamu AI scalper agresif binary option EUR/USD.\nREAL data: ${now.toLocaleTimeString('id-ID')} | Expiry: ${expiryStr}\n${data}\nAnalisa 3TF, smart money.\nJAWAB JSON saja: {"signal":"BUY|SELL|SKIP","confidence":75,"trend15m":"BULLISH|BEARISH|SIDEWAYS","smartmoney":true,"reasonopen":"max 100 char","reasonexpiry":"max 80 char","entryprice":1.15780}`;
+    const nowStr    = now.toLocaleTimeString('id-ID');
+    const prompt    = 'Kamu AI scalper binary option EURUSD. Jam WIB: ' + nowStr + '\n' + data + '\nPilih expiry terbaik antara ' + minStr + ' sd ' + maxStr + ' (format HH:MM, menit bulat WIB) berdasarkan momentum dan SR.\nBalas JSON: {signal:BUY/SELL/SKIP,confidence:75,trend15m:BULLISH/BEARISH/SIDEWAYS,smartmoney:true,expiry:' + minStr + ',reasonopen:alasan max100char,reasonexpiry:alasan expiry max80char,entryprice:1.15780}';
 
     // Call GPT menggunakan https bawaan (tanpa axios)
     const gptResult = await new Promise((resolve, reject) => {
@@ -207,7 +208,12 @@ app.post('/bot/signal', async (req, res) => {
 
     const raw = gptResult.choices[0].message.content.trim().replace(/```json|```/g, '').trim();
     const gpt = JSON.parse(raw);
-    gpt.expirytarget = expiryStr;
+    // Validasi expiry dari GPT - harus format HH:MM dan >= menit berikutnya
+    const gpExp   = (gpt.expiry || '').trim();
+    const validFmt = /^\d{2}:\d{2}$/.test(gpExp);
+    if (!validFmt || gpExp < minStr || gpExp > maxStr) {
+      gpt.expiry = minStr; // fallback ke menit terdekat jika GPT keliru
+    }
 
     // Catat usage +1
     user.usage_today++;
