@@ -99,8 +99,8 @@ app.post('/auth/use', (req, res) => {
 // BOT SIGNAL — GPT + TwelveData diproses di server (key aman)
 // ─────────────────────────────────────────────────────────────────
 const OPENAI_URL   = process.env.OPENAI_URL   || 'https://lite.koboillm.com/v1/chat/completions';
-const OPENAI_KEY   = process.env.OPENAI_KEY;
-const TWELVE_KEY   = process.env.TWELVE_KEY;
+const OPENAI_KEY   = process.env.OPENAI_KEY 'a99e7352827544e28063d1227ef76a4a';
+const TWELVE_KEY   = process.env.TWELVE_KEY 'sk-bbcQ_tgzKrXpMRTPXrxHvg';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'openai/gpt-4o-mini';
 
 app.post('/bot/signal', async (req, res) => {
