@@ -2,22 +2,28 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── ENV ──────────────────────────────────────────────────────────
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Bismilah2026';
 const JWT_SECRET = process.env.JWT_SECRET || 'avsgpt2026rahasia123';
+const OPENAI_URL = process.env.OPENAI_URL || 'https://lite.koboillm.com/v1/chat/completions';
+const OPENAI_KEY = process.env.OPENAI_KEY || 'a99e7352827544e28063d1227ef76a4a';
+const TWELVE_KEY = process.env.TWELVE_KEY || 'sk-bbcQ_tgzKrXpMRTPXrxHvg';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'openai/gpt-4o-mini';
 
-// ── MIDDLEWARE ───────────────────────────────────────────────────
-app.use(cors({ origin: '*', methods: ['GET','POST','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','x-admin-password','Authorization'] }));
-app.use(express.json());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-admin-password', 'Authorization']
+}));
+app.use(express.json({ limit: '1mb' }));
 
-// ── IN-MEMORY DB ─────────────────────────────────────────────────
 let users = {};
+const PLAN_LIMIT = { free: 10, pro: 30 };
 
-// Reset usage harian
 function resetIfNewDay(user) {
   const today = new Date().toDateString();
   if (user.last_reset !== today) {
@@ -26,9 +32,6 @@ function resetIfNewDay(user) {
   }
 }
 
-const PLAN_LIMIT = { free: 10, pro: 30 };
-
-// ── MIDDLEWARE ADMIN AUTH ────────────────────────────────────────
 function adminAuth(req, res, next) {
   const pass = req.headers['x-admin-password'];
   if (!pass || pass !== ADMIN_PASSWORD) {
@@ -37,17 +40,115 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ─────────────────────────────────────────────────────────────────
-// PUBLIC ENDPOINTS
-// ─────────────────────────────────────────────────────────────────
+function hhmm(date) {
+  return String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0');
+}
+
+function diffMinutesFrom(nowRef, hhmmStr) {
+  if (!/^\d{2}:\d{2}$/.test(String(hhmmStr || ''))) return null;
+  const [h, m] = String(hhmmStr).split(':').map(Number);
+  const t = new Date(nowRef.getFullYear(), nowRef.getMonth(), nowRef.getDate(), h, m, 0, 0);
+  let diff = (t.getTime() - nowRef.getTime()) / 60000;
+  if (diff < -720) diff += 1440;
+  return diff;
+}
+
+function fetchJson(url, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { timeout }, (r) => {
+      let data = '';
+      r.on('data', d => data += d);
+      r.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('HTTP timeout')));
+  });
+}
+
+async function fetchCandle(symbol, interval, size) {
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${size}&apikey=${TWELVE_KEY}`;
+  const json = await fetchJson(url, 15000);
+  if (json.status === 'error') throw new Error('TwelveData: ' + json.message);
+  if (!Array.isArray(json.values) || !json.values.length) throw new Error('TwelveData kosong');
+  return json.values.map(v => ({
+    o: parseFloat(v.open),
+    h: parseFloat(v.high),
+    l: parseFloat(v.low),
+    c: parseFloat(v.close)
+  })).reverse();
+}
+
+function fmtC(candles, label) {
+  let out = label + '\n';
+  candles.slice(-8).forEach((c, i) => {
+    out += `${i + 1} O:${c.o.toFixed(5)} H:${c.h.toFixed(5)} L:${c.l.toFixed(5)} C:${c.c.toFixed(5)}\n`;
+  });
+  return out;
+}
+
+function parseFirstJson(raw) {
+  const cleaned = String(raw || '').replace(/```json|```/gi, '').trim();
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('GPT tidak return JSON valid');
+  return JSON.parse(match[0]);
+}
+
+function postOpenAI(messages) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model: OPENAI_MODEL,
+      messages,
+      max_tokens: 320,
+      temperature: 0.25,
+      response_format: { type: 'json_object' }
+    });
+
+    const urlObj = new URL(OPENAI_URL);
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || 443,
+      path: (urlObj.pathname || '/') + (urlObj.search || ''),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_KEY}`,
+        'Content-Length': Buffer.byteLength(body)
+      },
+      timeout: 20000
+    };
+
+    const req = https.request(options, (r) => {
+      let data = '';
+      r.on('data', chunk => data += chunk);
+      r.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('GPT timeout')));
+    req.write(body);
+    req.end();
+  });
+}
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, message: 'AVS Bot Server aktif 🚀', time: new Date().toISOString(), userCount: Object.keys(users).length });
+  res.json({ ok: true, message: 'AVS Bot Server aktif', time: new Date().toISOString(), userCount: Object.keys(users).length });
 });
 
 app.post('/auth/login', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { username, password } = req.body || {};
     if (!username || !password) return res.json({ ok: false, error: 'Username & password wajib' });
     const user = users[username];
     if (!user) return res.json({ ok: false, error: 'Username tidak ditemukan' });
@@ -63,7 +164,7 @@ app.post('/auth/login', async (req, res) => {
 
 app.post('/auth/verify', (req, res) => {
   try {
-    const { token } = req.body;
+    const { token } = req.body || {};
     if (!token) return res.json({ ok: false, error: 'Token tidak ada' });
     const decoded = jwt.verify(token, JWT_SECRET);
     const user = users[decoded.username];
@@ -78,7 +179,7 @@ app.post('/auth/verify', (req, res) => {
 
 app.post('/auth/use', (req, res) => {
   try {
-    const { token } = req.body;
+    const { token } = req.body || {};
     if (!token) return res.json({ ok: false, error: 'Token tidak ada' });
     const decoded = jwt.verify(token, JWT_SECRET);
     const user = users[decoded.username];
@@ -95,154 +196,86 @@ app.post('/auth/use', (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────
-// BOT SIGNAL — GPT + TwelveData diproses di server (key aman)
-// ─────────────────────────────────────────────────────────────────
-const OPENAI_URL   = process.env.OPENAI_URL   || 'https://lite.koboillm.com/v1/chat/completions';
-const OPENAI_KEY = process.env.OPENAI_KEY || 'sk-bbcQ_tgzKrXpMRTPXrxHvg';
-const TWELVE_KEY = process.env.TWELVE_KEY || 'a99e7352827544e28063d1227ef76a4a';
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'openai/gpt-4o-mini';
-
 app.post('/bot/signal', async (req, res) => {
   try {
-    const { token, expirymin, symbol } = req.body;
+    const { token, expirymin, expirymax, symbol } = req.body || {};
     if (!token) return res.json({ ok: false, error: 'Token tidak ada' });
+    if (!OPENAI_KEY || !TWELVE_KEY) return res.json({ ok: false, error: 'Server belum dikonfigurasi (OPENAI_KEY / TWELVE_KEY kosong)' });
 
-    // Verifikasi token
     let decoded;
-    try { decoded = jwt.verify(token, JWT_SECRET); }
-    catch(e) { return res.json({ ok: false, error: 'Token tidak valid atau expired' }); }
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+      return res.json({ ok: false, error: 'Token tidak valid atau expired' });
+    }
 
     const user = users[decoded.username];
     if (!user || !user.is_active) return res.json({ ok: false, error: 'Akun tidak aktif' });
 
-    // Reset usage jika hari baru
     resetIfNewDay(user);
     const limit = PLAN_LIMIT[user.plan] || 5;
-
     if (user.usage_today >= limit) {
       return res.json({ ok: false, error: `Limit harian habis! (${user.usage_today}/${limit}). Reset besok jam 00:00.`, usage: user.usage_today, limit });
     }
 
-    if (!OPENAI_KEY || !TWELVE_KEY) {
-      return res.json({ ok: false, error: 'Server belum dikonfigurasi (OPENAI_KEY / TWELVE_KEY kosong)' });
-    }
-
-    const sym    = symbol    || 'EUR/USD';
-    const EXPMIN = expirymin || 2;
-    const https  = require('https');
-
-    // Fetch candle TwelveData menggunakan https bawaan (tanpa axios)
-    function fetchCandle(interval, size) {
-      return new Promise((resolve, reject) => {
-        const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${interval}&outputsize=${size}&apikey=${TWELVE_KEY}`;
-        https.get(url, (r) => {
-          let data = '';
-          r.on('data', d => data += d);
-          r.on('end', () => {
-            try {
-              const json = JSON.parse(data);
-              if (json.status === 'error') return reject(new Error('TwelveData: ' + json.message));
-              const candles = json.values.map(v => ({
-                o: parseFloat(v.open), h: parseFloat(v.high),
-                l: parseFloat(v.low),  c: parseFloat(v.close)
-              })).reverse();
-              resolve(candles);
-            } catch(e) { reject(e); }
-          });
-        }).on('error', reject);
-      });
-    }
+    const sym = String(symbol || 'EUR/USD').trim();
+    const expMin = Math.max(1, parseInt(expirymin || 5, 10));
+    const expMax = Math.max(expMin, parseInt(expirymax || 30, 10));
 
     const [c1m, c5m, c15m] = await Promise.all([
-      fetchCandle('1min', 15),
-      fetchCandle('5min', 15),
-      fetchCandle('15min', 15),
+      fetchCandle(sym, '1min', 18),
+      fetchCandle(sym, '5min', 18),
+      fetchCandle(sym, '15min', 18)
     ]);
 
-    function fmtC(candles, label) {
-      let o = label + '\n';
-      candles.slice(-8).forEach((c, i) => {
-        o += `${i+1} O:${c.o.toFixed(5)} H:${c.h.toFixed(5)} L:${c.l.toFixed(5)} C:${c.c.toFixed(5)}\n`;
-      });
-      return o;
+    const now = new Date();
+    const baseMin = new Date(Math.ceil(now.getTime() / 60000) * 60000);
+    const minExpiryDate = new Date(baseMin.getTime() + expMin * 60000);
+    const maxExpiryDate = new Date(baseMin.getTime() + expMax * 60000);
+    const minStr = hhmm(minExpiryDate);
+    const maxStr = hhmm(maxExpiryDate);
+    const nowStr = now.toLocaleTimeString('id-ID', { hour12: false });
+    const data = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
+
+    const sysMsg = 'You are a binary options trading signal AI. Always respond with valid JSON only. Allowed signal values: BUY, SELL, HOLD. Use HOLD if market is choppy, late, unclear, weak, or low quality. Required keys: signal, confidence, trend15m, smartmoney, expiry, reasonopen, reasonexpiry, entryprice.';
+    const userMsg = `Data ${sym} jam WIB ${nowStr}:\n${data}\nCari setup selektif. Expiry harus antara ${minStr} sampai ${maxStr} (HH:MM WIB, menit bulat). Jangan paksa entry. Jika market chop, telat, atau struktur tidak clean, pilih HOLD. Balas HANYA JSON: {"signal":"HOLD","confidence":65,"trend15m":"BULLISH","smartmoney":true,"expiry":"${minStr}","reasonopen":"setup belum clean","reasonexpiry":"menunggu momentum lebih valid","entryprice":1.15780}`;
+
+    const gptResult = await postOpenAI([
+      { role: 'system', content: sysMsg },
+      { role: 'user', content: userMsg }
+    ]);
+
+    const raw = gptResult?.choices?.[0]?.message?.content;
+    if (!raw) throw new Error('Respons GPT kosong');
+
+    const gpt = parseFirstJson(raw);
+    gpt.signal = ['BUY', 'SELL', 'HOLD'].includes(String(gpt.signal || '').toUpperCase()) ? String(gpt.signal).toUpperCase() : 'HOLD';
+    gpt.confidence = Math.max(0, Math.min(100, parseInt(gpt.confidence || 0, 10) || 0));
+    gpt.trend15m = String(gpt.trend15m || 'SIDEWAYS').toUpperCase();
+    gpt.smartmoney = !!gpt.smartmoney;
+    gpt.reasonopen = String(gpt.reasonopen || 'Analisa server');
+    gpt.reasonexpiry = String(gpt.reasonexpiry || 'Expiry disesuaikan dengan kualitas setup');
+    gpt.entryprice = Number(gpt.entryprice || c1m[c1m.length - 1].c || 0);
+
+    const gpExp = String(gpt.expiry || '').trim();
+    const diffMin = diffMinutesFrom(now, gpExp);
+    if (!/^\d{2}:\d{2}$/.test(gpExp) || diffMin == null || diffMin < expMin || diffMin > expMax) {
+      gpt.expiry = minStr;
+      gpt.reasonexpiry += ' [server-adjusted]';
     }
 
-    const now       = new Date();
-    // Hitung range expiry WIB: menit bulat berikutnya s/d +5 menit
-    const nextMin   = new Date(Math.ceil((now.getTime() + 30000) / 60000) * 60000);
-    const maxExpiry = new Date(nextMin.getTime() + 4 * 60000);
-    const minStr    = String(nextMin.getHours()).padStart(2,'0') + ':' + String(nextMin.getMinutes()).padStart(2,'0');
-    const maxStr    = String(maxExpiry.getHours()).padStart(2,'0') + ':' + String(maxExpiry.getMinutes()).padStart(2,'0');
-    const data      = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
-    const nowStr    = now.toLocaleTimeString('id-ID');
-    const sysMsg  = 'You are a binary option trading signal AI. ALWAYS respond with valid JSON only. No explanation, no markdown, no extra text. Required keys: signal, confidence, trend15m, smartmoney, expiry, reasonopen, reasonexpiry, entryprice';
-    const userMsg = 'Data EURUSD jam WIB ' + nowStr + ':\n' + data +
-      '\nExpiry terbaik antara ' + minStr + ' sd ' + maxStr + ' (HH:MM WIB, menit bulat).\n' +
-      'Balas HANYA JSON:\n{"signal":"BUY","confidence":75,"trend15m":"BULLISH",' +
-      '"smartmoney":true,"expiry":"' + minStr + '","reasonopen":"alasan<100chr",' +
-      '"reasonexpiry":"alasan expiry<80chr","entryprice":1.15780}';
-
-    // Call GPT menggunakan https bawaan (tanpa axios)
-    const gptResult = await new Promise((resolve, reject) => {
-      const body = JSON.stringify({
-        model: OPENAI_MODEL,
-        messages: [
-          { role: 'system', content: sysMsg },
-          { role: 'user',   content: userMsg }
-        ],
-        max_tokens: 300,
-        temperature: 0.3
-      });
-      const urlObj = new URL(OPENAI_URL);
-      const options = {
-        hostname: urlObj.hostname,
-        path: urlObj.pathname,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${OPENAI_KEY}`,
-          'Content-Length': Buffer.byteLength(body)
-        },
-        timeout: 15000
-      };
-      const reqHttp = https.request(options, (r) => {
-        let d = '';
-        r.on('data', chunk => d += chunk);
-        r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
-      });
-      reqHttp.on('error', reject);
-      reqHttp.on('timeout', () => reject(new Error('GPT timeout')));
-      reqHttp.write(body);
-      reqHttp.end();
-    });
-
-    let raw = gptResult.choices[0].message.content.trim();
-    raw = raw.replace(/```json|```/gi, '').trim();
-    // Ekstrak JSON object pertama dari respons
-    const jm = raw.match(/\{[\s\S]*\}/);
-    if (!jm) throw new Error('GPT tidak return JSON valid: ' + raw.substring(0,80));
-    const gpt = JSON.parse(jm[0]);
-    // Validasi expiry dari GPT - harus format HH:MM dan >= menit berikutnya
-    const gpExp   = (gpt.expiry || '').trim();
-    const validFmt = /^\d{2}:\d{2}$/.test(gpExp);
-    if (!validFmt || gpExp < minStr || gpExp > maxStr) {
-      gpt.expiry = minStr; // fallback ke menit terdekat jika GPT keliru
+    if (gpt.signal !== 'HOLD' && gpt.confidence < 60) {
+      gpt.signal = 'HOLD';
+      gpt.reasonopen = 'Confidence terlalu rendah, ditahan oleh server';
     }
 
-    // Catat usage +1
     user.usage_today++;
-
     res.json({ ok: true, signal: gpt, usage: user.usage_today, limit, remaining: limit - user.usage_today });
   } catch (e) {
     console.error('/bot/signal error:', e.message);
     res.json({ ok: false, error: 'Gagal ambil sinyal: ' + e.message });
   }
 });
-
-// ─────────────────────────────────────────────────────────────────
-// ADMIN ENDPOINTS
-// ─────────────────────────────────────────────────────────────────
 
 app.get('/admin/users', adminAuth, (req, res) => {
   const list = Object.entries(users).map(([username, u]) => {
@@ -254,26 +287,35 @@ app.get('/admin/users', adminAuth, (req, res) => {
 
 app.post('/admin/create-user', adminAuth, async (req, res) => {
   try {
-    const { username, password, plan = 'free' } = req.body;
+    const { username, password, plan = 'free' } = req.body || {};
     if (!username || !password) return res.json({ ok: false, error: 'Username & password wajib' });
     if (users[username]) return res.json({ ok: false, error: 'Username sudah ada' });
-    if (password.length < 6) return res.json({ ok: false, error: 'Password minimal 6 karakter' });
+    if (String(password).length < 6) return res.json({ ok: false, error: 'Password minimal 6 karakter' });
     const passwordHash = await bcrypt.hash(password, 10);
-    users[username] = { passwordHash, plan: ['free','pro'].includes(plan) ? plan : 'free', is_active: true, usage_today: 0, last_reset: new Date().toDateString(), created_at: new Date().toISOString() };
-    res.json({ ok: true, message: `User "${username}" [${plan.toUpperCase()}] berhasil dibuat!` });
-  } catch (e) { res.json({ ok: false, error: e.message }); }
+    users[username] = {
+      passwordHash,
+      plan: ['free', 'pro'].includes(plan) ? plan : 'free',
+      is_active: true,
+      usage_today: 0,
+      last_reset: new Date().toDateString(),
+      created_at: new Date().toISOString()
+    };
+    res.json({ ok: true, message: `User \"${username}\" [${users[username].plan.toUpperCase()}] berhasil dibuat!` });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
 });
 
 app.patch('/admin/set-plan', adminAuth, (req, res) => {
-  const { username, plan } = req.body;
+  const { username, plan } = req.body || {};
   if (!users[username]) return res.json({ ok: false, error: 'User tidak ditemukan' });
-  if (!['free','pro'].includes(plan)) return res.json({ ok: false, error: 'Plan tidak valid' });
+  if (!['free', 'pro'].includes(plan)) return res.json({ ok: false, error: 'Plan tidak valid' });
   users[username].plan = plan;
   res.json({ ok: true, message: `Plan ${username} diubah ke ${plan.toUpperCase()}` });
 });
 
 app.patch('/admin/set-active', adminAuth, (req, res) => {
-  const { username, is_active } = req.body;
+  const { username, is_active } = req.body || {};
   if (!users[username]) return res.json({ ok: false, error: 'User tidak ditemukan' });
   users[username].is_active = !!is_active;
   res.json({ ok: true, message: `User ${username} ${is_active ? 'diaktifkan' : 'dinonaktifkan'}` });
@@ -281,16 +323,18 @@ app.patch('/admin/set-active', adminAuth, (req, res) => {
 
 app.patch('/admin/reset-password', adminAuth, async (req, res) => {
   try {
-    const { username, new_password } = req.body;
+    const { username, new_password } = req.body || {};
     if (!users[username]) return res.json({ ok: false, error: 'User tidak ditemukan' });
-    if (!new_password || new_password.length < 6) return res.json({ ok: false, error: 'Password minimal 6 karakter' });
+    if (!new_password || String(new_password).length < 6) return res.json({ ok: false, error: 'Password minimal 6 karakter' });
     users[username].passwordHash = await bcrypt.hash(new_password, 10);
     res.json({ ok: true, message: `Password ${username} berhasil direset` });
-  } catch (e) { res.json({ ok: false, error: e.message }); }
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
 });
 
 app.patch('/admin/reset-usage', adminAuth, (req, res) => {
-  const { username } = req.body;
+  const { username } = req.body || {};
   if (!users[username]) return res.json({ ok: false, error: 'User tidak ditemukan' });
   users[username].usage_today = 0;
   users[username].last_reset = new Date().toDateString();
@@ -298,18 +342,17 @@ app.patch('/admin/reset-usage', adminAuth, (req, res) => {
 });
 
 app.delete('/admin/delete-user', adminAuth, (req, res) => {
-  const { username } = req.body;
+  const { username } = req.body || {};
   if (!users[username]) return res.json({ ok: false, error: 'User tidak ditemukan' });
   delete users[username];
   res.json({ ok: true, message: `User ${username} dihapus` });
 });
 
-// ── 404 HANDLER ──────────────────────────────────────────────────
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: `Endpoint "${req.method} ${req.path}" tidak ditemukan` });
+  res.status(404).json({ ok: false, error: `Endpoint \"${req.method} ${req.path}\" tidak ditemukan` });
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ AVS Bot Server jalan di port ${PORT}`);
-  console.log(`🔑 Admin password: ${ADMIN_PASSWORD}`);
+  console.log(`AVS Bot Server jalan di port ${PORT}`);
+  console.log(`Admin password: ${ADMIN_PASSWORD}`);
 });
