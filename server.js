@@ -17,6 +17,18 @@ app.use(express.json());
 // ── IN-MEMORY DB ─────────────────────────────────────────────────
 let users = {};
 
+// ── PAIR BOX CACHE [v5.0] ─────────────────────────────────────────
+// 1 pair = 1 analisis bersama. Semua user dapat hasil yang sama
+// selama TTL belum habis. GPT + TwelveData hanya dipanggil saat stale.
+// TODO: Ganti dengan Redis agar persist saat Railway restart.
+const pairBox = {};
+const BOX_TTL = 3 * 60 * 1000; // 3 menit TTL per pair
+
+function boxFresh(sym) {
+  const b = pairBox[sym];
+  return b && (Date.now() - b.ts) < BOX_TTL;
+}
+
 // Reset usage harian
 function resetIfNewDay(user) {
   const today = new Date().toDateString();
@@ -124,15 +136,34 @@ app.post('/bot/signal', async (req, res) => {
       return res.json({ ok: false, error: `Limit harian habis! (${user.usage_today}/${limit}). Reset besok jam 00:00.`, usage: user.usage_today, limit });
     }
 
+    const sym    = symbol    || 'EUR/USD';
+    const EXPMIN = expirymin || 5; // [v5.0] default 5 menit (minimum expiry GPT)
+
+    // ── [v5.0] PAIR BOX CACHE — serve shared analysis jika masih fresh ──
+    // Tidak memanggil TwelveData maupun GPT jika box belum stale.
+    // Semua user yang request dalam window BOX_TTL mendapat analisis yang sama.
+    if (boxFresh(sym)) {
+      user.usage_today++;
+      const cached = pairBox[sym];
+      const ageS   = Math.round((Date.now() - cached.ts) / 1000);
+      return res.json({
+        ok: true,
+        signal:      cached.data,
+        candles_1m:  cached.candles_1m,
+        source:      'cache',
+        box_age_sec: ageS,
+        usage: user.usage_today, limit, remaining: limit - user.usage_today
+      });
+    }
+
+    // ── BOX STALE: REBUILD — fetch TwelveData + call GPT ────────────
     if (!OPENAI_KEY || !TWELVE_KEY) {
       return res.json({ ok: false, error: 'Server belum dikonfigurasi (OPENAI_KEY / TWELVE_KEY kosong)' });
     }
 
-    const sym    = symbol    || 'EUR/USD';
-    const EXPMIN = expirymin || 2;
-    const https  = require('https');
+    const https = require('https');
 
-    // Fetch candle TwelveData menggunakan https bawaan (tanpa axios)
+    // Fetch candle dari TwelveData (native https, tanpa axios)
     function fetchCandle(interval, size) {
       return new Promise((resolve, reject) => {
         const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${interval}&outputsize=${size}&apikey=${TWELVE_KEY}`;
@@ -154,15 +185,17 @@ app.post('/bot/signal', async (req, res) => {
       });
     }
 
+    // [v5.0] 30 candle per TF — cukup untuk analisis 3TF profesional
     const [c1m, c5m, c15m] = await Promise.all([
-      fetchCandle('1min', 15),
-      fetchCandle('5min', 15),
-      fetchCandle('15min', 15),
+      fetchCandle('1min',  30),
+      fetchCandle('5min',  30),
+      fetchCandle('15min', 30),
     ]);
 
+    // Format 10 candle terakhir per TF untuk prompt GPT
     function fmtC(candles, label) {
       let o = label + '\n';
-      candles.slice(-8).forEach((c, i) => {
+      candles.slice(-10).forEach((c, i) => {
         o += `${i+1} O:${c.o.toFixed(5)} H:${c.h.toFixed(5)} L:${c.l.toFixed(5)} C:${c.c.toFixed(5)}\n`;
       });
       return o;
@@ -172,14 +205,23 @@ app.post('/bot/signal', async (req, res) => {
     const target    = new Date(now.getTime() + EXPMIN * 60 * 1000);
     const expiryStr = String(target.getHours()).padStart(2,'0') + ':' + String(target.getMinutes()).padStart(2,'0');
     const data      = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
-    const prompt    = `Kamu AI scalper agresif binary option EUR/USD.\nREAL data: ${now.toLocaleTimeString('id-ID')} | Expiry: ${expiryStr}\n${data}\nAnalisa 3TF, smart money.\nJAWAB JSON saja: {"signal":"BUY|SELL|SKIP","confidence":75,"trend15m":"BULLISH|BEARISH|SIDEWAYS","smartmoney":true,"reasonopen":"max 100 char","reasonexpiry":"max 80 char","entryprice":1.15780}`;
 
-    // Call GPT menggunakan https bawaan (tanpa axios)
+    // [v5.0] Prompt diperkaya: minta srLevels + trend5m + biasStrength
+    // agar client-side rule engine (checkConfirm) punya data cukup
+    const prompt = `Kamu AI scalper profesional binary option ${sym}.
+REAL data: ${now.toLocaleTimeString('id-ID')} | Expiry range: ${EXPMIN}–30 menit
+${data}
+Analisa 3TF mendalam: trend structure, smart money concept, supply demand zone, momentum.
+Hanya beri BUY/SELL jika setup jelas dan tervalidasi. Beri SKIP jika market ragu/sideways.
+JAWAB JSON saja (tanpa komentar, tanpa markdown):
+{"signal":"BUY|SELL|SKIP","confidence":75,"trend15m":"BULLISH|BEARISH|SIDEWAYS","trend5m":"BULLISH|BEARISH|SIDEWAYS","smartmoney":true,"biasStrength":"STRONG|MODERATE|WEAK","srLevels":{"s1":1.15720,"s2":1.15680,"r1":1.15820,"r2":1.15880},"reasonopen":"max 100 char","reasonexpiry":"max 80 char","entryprice":1.15780,"expiry":"${expiryStr}"}`;
+
+    // Call GPT (native https, tanpa axios)
     const gptResult = await new Promise((resolve, reject) => {
       const body = JSON.stringify({
         model: OPENAI_MODEL,
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 220,
+        max_tokens: 320,
         temperature: 0.3
       });
       const urlObj = new URL(OPENAI_URL);
@@ -209,10 +251,25 @@ app.post('/bot/signal', async (req, res) => {
     const gpt = JSON.parse(raw);
     gpt.expirytarget = expiryStr;
 
+    // [v5.0] Simpan ke pair box cache — 10 candle 1m untuk checkConfirm() client
+    const candles1mBox = c1m.slice(-10);
+    pairBox[sym] = {
+      ts:         Date.now(),
+      data:       gpt,
+      candles_1m: candles1mBox
+    };
+    console.log(`[PairBox] ${sym} rebuilt — signal: ${gpt.signal} conf:${gpt.confidence}%`);
+
     // Catat usage +1
     user.usage_today++;
 
-    res.json({ ok: true, signal: gpt, usage: user.usage_today, limit, remaining: limit - user.usage_today });
+    res.json({
+      ok: true,
+      signal:     gpt,
+      candles_1m: candles1mBox,
+      source:     'fresh',
+      usage: user.usage_today, limit, remaining: limit - user.usage_today
+    });
   } catch (e) {
     console.error('/bot/signal error:', e.message);
     res.json({ ok: false, error: 'Gagal ambil sinyal: ' + e.message });
