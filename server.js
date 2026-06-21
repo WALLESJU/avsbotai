@@ -349,15 +349,17 @@ app.post('/bot/momentum-plan', async (req, res) => {
       return res.json({ ok: false, error: `Limit harian habis! (${user.usage_today}/${limit}).`, usage: user.usage_today, limit });
     }
 
-    // Market closed check
+    // [HOTFIX] Momentum PLAN GENERATION tidak boleh diblok market closed.
+    // Live /bot/signal tetap diblok (lihat endpoint di atas) — hanya endpoint ini yang dilonggarkan,
+    // karena execution real tetap dijaga di client (executeSignalFromPlan/momentumLoop cek isMarketOpen()).
     if (!isForexMarketOpen()) {
-      return res.json({ ok: false, status: 'SKIP_MARKET_CLOSED', error: 'MARKET CLOSED — Forex tutup akhir pekan' });
+      console.log(`[Momentum] ${decoded.username} generate plan saat market closed — MOMENTUM_PLAN_ALLOWED_WHEN_MARKET_CLOSED`);
     }
 
     const sym      = pair || 'EUR/USD';
     const trendDir = (trend === 'UP' || trend === 'DOWN') ? trend : 'UP';
     const interval = parseInt(interval_minutes) || 5;
-    const durationH = parseFloat(duration_hours) || 2;
+    const durationH = parseFloat(duration_hours) || 5; // [HOTFIX] default 2 jam → 5 jam
     const planKey  = sym + '|' + trendDir;
 
     // Anti-overlap
