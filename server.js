@@ -413,13 +413,22 @@ Snapshot market: ${snapshot}
 
 Buat signal plan ${durationH} jam dengan interval ${interval} menit.
 Karena trend ${trendDir}, mayoritas signal harus ${trendDir === 'UP' ? 'BUY' : 'SELL'}. Boleh HOLD jika area kurang ideal.
-Timestamp WIB yang harus diisi (TEPAT ${totalSig} signal): ${sigTimes.join(', ')}
+Timestamp WIB yang harus diisi (TEPAT ${totalSig} signal, jangan kurang jangan lebih): ${sigTimes.join(', ')}
 
-JAWAB JSON saja:
+ATURAN OUTPUT (WAJIB, JANGAN DILANGGAR):
+- Balas HANYA dengan JSON valid, tidak ada teks lain sebelum atau sesudahnya.
+- JSON harus SATU BARIS saja (tanpa newline, tanpa indentasi/spasi ekstra di dalam JSON).
+- DILARANG memakai markdown, code fence (tiga backtick), komentar, atau penjelasan apapun.
+- DILARANG ada trailing comma.
+- Setiap signal HANYA boleh berisi field "time" dan "action" — jangan tambah field lain (misal reason/alasan).
+- Array "signals" harus berisi TEPAT ${totalSig} item, urut sesuai daftar timestamp di atas.
+- Hasil harus bisa langsung diparse oleh JSON.parse tanpa modifikasi.
+
+Format JSON (ikuti struktur ini persis, isi SEMUA ${totalSig} signal, satu baris):
 {"strategy":"MOMENTUM","pair":"${sym}","trend":"${trendDir}","generated_at":"${getWIBISOStr(now)}","valid_from":"${sigTimes[0]}","valid_until":"${sigTimes[sigTimes.length-1]}","timezone":"Asia/Jakarta","interval_minutes":${interval},"signals":[{"time":"${sigTimes[0]}","action":"BUY"}]}`;
 
     const gptResult = await new Promise((resolve, reject) => {
-      const body = JSON.stringify({ model: OPENAI_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 1800, temperature: 0.3 });
+      const body = JSON.stringify({ model: OPENAI_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 2600, temperature: 0.3 });
       const urlObj = new URL(OPENAI_URL);
       const opts = {
         hostname: urlObj.hostname, path: urlObj.pathname, method: 'POST',
@@ -436,8 +445,21 @@ JAWAB JSON saja:
       req2.write(body); req2.end();
     });
 
-    const raw  = gptResult.choices[0].message.content.trim().replace(/\`\`\`json|\`\`\`/g, '').trim();
-    const plan = JSON.parse(raw);
+    let raw = gptResult.choices[0].message.content.trim().replace(/\`\`\`json|\`\`\`/g, '').trim();
+    // [HOTFIX] Buang teks/markdown apapun di luar objek JSON sebelum diparse,
+    // jaga-jaga GPT menambahkan teks/penjelasan di luar instruksi.
+    const _firstBrace = raw.indexOf('{');
+    const _lastBrace  = raw.lastIndexOf('}');
+    if (_firstBrace !== -1 && _lastBrace !== -1 && _lastBrace > _firstBrace) {
+      raw = raw.substring(_firstBrace, _lastBrace + 1);
+    }
+    let plan;
+    try {
+      plan = JSON.parse(raw);
+    } catch (parseErr) {
+      momentumLock[planKey] = false;
+      return res.json({ ok: false, status: 'GPT_FAILED', error: 'Output GPT bukan JSON valid (kemungkinan respons terpotong/format salah): ' + parseErr.message });
+    }
 
     // Validasi output
     if (!plan || plan.strategy !== 'MOMENTUM' || !Array.isArray(plan.signals) || plan.signals.length < 1) {
