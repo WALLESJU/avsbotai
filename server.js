@@ -29,6 +29,34 @@ function boxFresh(sym) {
   return b && (Date.now() - b.ts) < BOX_TTL;
 }
 
+
+// ── TIMEZONE + MARKET HELPERS [v6.0] ─────────────────────────────
+
+// WIB time string konsisten (Asia/Jakarta)
+function getWIBStr(dateObj) {
+  return dateObj.toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit', hour12: false });
+}
+function getWIBISOStr(dateObj) {
+  // ISO 8601 dengan offset +07:00
+  const d = new Date(dateObj.getTime() + 7 * 3600000);
+  return d.toISOString().slice(0, 19) + '+07:00';
+}
+
+// Cek apakah pasar forex sedang buka
+// Forex tutup: Jumat 22:00 UTC (=Sabtu 05:00 WIB) s.d. Minggu 22:00 UTC (=Senin 05:00 WIB)
+function isForexMarketOpen() {
+  const d    = new Date();
+  const day  = d.getUTCDay();          // 0=Sun, 5=Fri, 6=Sat
+  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  if (day === 6) return false;                  // Sabtu UTC = tutup seharian
+  if (day === 5 && mins >= 22 * 60) return false; // Jumat >= 22:00 UTC
+  if (day === 0 && mins < 22 * 60) return false;  // Minggu sebelum 22:00 UTC
+  return true;
+}
+
+// Anti-overlap: lock per pair saat GPT rebuild berjalan
+const pairLock = {}; // { 'EUR/USD': true/false }
+
 // Reset usage harian
 function resetIfNewDay(user) {
   const today = new Date().toDateString();
@@ -142,15 +170,20 @@ app.post('/bot/signal', async (req, res) => {
     }
 
     const sym    = symbol    || 'EUR/USD';
-    const EXPMIN = expirymin || 5; // [v5.0] default 5 menit (minimum expiry GPT)
+    const EXPMIN = expirymin || 5;
+
+    // [v6.0] Market closed check — jangan panggil GPT saat weekend
+    if (!isForexMarketOpen()) {
+      return res.json({ ok: false, status: 'SKIP_MARKET_CLOSED', error: 'MARKET CLOSED — Forex tutup akhir pekan' });
+    }
 
     // ── [v5.0] PAIR BOX CACHE — serve shared analysis jika masih fresh ──
-    // Tidak memanggil TwelveData maupun GPT jika box belum stale.
-    // Semua user yang request dalam window BOX_TTL mendapat analisis yang sama.
     if (boxFresh(sym)) {
-      user.usage_today++;
       const cached = pairBox[sym];
       const ageS   = Math.round((Date.now() - cached.ts) / 1000);
+      // [v6.0] Usage hanya naik jika signal BUY/SELL, bukan SKIP
+      const sig = cached.data.signal;
+      if (sig === 'BUY' || sig === 'SELL') user.usage_today++;
       return res.json({
         ok: true,
         signal:      cached.data,
@@ -161,10 +194,16 @@ app.post('/bot/signal', async (req, res) => {
       });
     }
 
-    // ── BOX STALE: REBUILD — fetch TwelveData + call GPT ────────────
+    // ── BOX STALE: REBUILD ────────────────────────────────────────
     if (!OPENAI_KEY || !TWELVE_KEY) {
       return res.json({ ok: false, error: 'Server belum dikonfigurasi (OPENAI_KEY / TWELVE_KEY kosong)' });
     }
+
+    // [v6.0] Anti-overlap: tolak jika pair sedang dianalisis
+    if (pairLock[sym]) {
+      return res.json({ ok: false, status: 'SKIP_GPT_IN_PROGRESS', error: 'Analisis sedang berjalan untuk pair ini, coba lagi sebentar' });
+    }
+    pairLock[sym] = true;
 
     const https = require('https');
 
@@ -208,13 +247,13 @@ app.post('/bot/signal', async (req, res) => {
 
     const now       = new Date();
     const target    = new Date(now.getTime() + EXPMIN * 60 * 1000);
-    const expiryStr = String(target.getHours()).padStart(2,'0') + ':' + String(target.getMinutes()).padStart(2,'0');
+    // [v6.0] Expiry dalam WIB (Asia/Jakarta), bukan UTC server
+    const expiryStr = getWIBStr(target);
+    const nowWIBStr = getWIBStr(now);
     const data      = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
 
-    // [v5.0] Prompt diperkaya: minta srLevels + trend5m + biasStrength
-    // agar client-side rule engine (checkConfirm) punya data cukup
     const prompt = `Kamu AI scalper profesional binary option ${sym}.
-REAL data: ${now.toLocaleTimeString('id-ID')} | Expiry range: ${EXPMIN}–30 menit
+REAL data: ${nowWIBStr} WIB | Expiry range: ${EXPMIN}–30 menit
 ${data}
 Analisa 3TF mendalam: trend structure, smart money concept, supply demand zone, momentum.
 Hanya beri BUY/SELL jika setup jelas dan tervalidasi. Beri SKIP jika market ragu/sideways.
@@ -256,18 +295,21 @@ JAWAB JSON saja (tanpa komentar, tanpa markdown):
     const gpt = JSON.parse(raw);
     gpt.expirytarget = expiryStr;
 
-    // [v5.0] Simpan ke pair box cache — 10 candle 1m untuk checkConfirm() client
+    // [v5.0] Simpan ke pair box cache
     const candles1mBox = c1m.slice(-10);
-    pairBox[sym] = {
-      ts:         Date.now(),
-      data:       gpt,
-      candles_1m: candles1mBox
-    };
-    console.log(`[PairBox] ${sym} rebuilt — signal: ${gpt.signal} conf:${gpt.confidence}%`);
+    pairBox[sym] = { ts: Date.now(), data: gpt, candles_1m: candles1mBox };
+    console.log(`[PairBox] ${sym} rebuilt — signal:${gpt.signal} conf:${gpt.confidence}% expiry:${expiryStr} WIB`);
 
-    // Catat usage +1
-    user.usage_today++;
+    // [v6.0] Usage hanya naik jika BUY/SELL — SKIP tidak mengurangi kuota
+    const finalSig = gpt.signal;
+    if (finalSig === 'BUY' || finalSig === 'SELL') {
+      user.usage_today++;
+      console.log(`[Usage] ${decoded.username} → ${user.usage_today}/${limit} (GPT_PLAN_GENERATED signal=${finalSig})`);
+    } else {
+      console.log(`[Usage] ${decoded.username} → unchanged (SKIP_NO_SIGNAL)`);
+    }
 
+    pairLock[sym] = false;
     res.json({
       ok: true,
       signal:     gpt,
@@ -276,8 +318,157 @@ JAWAB JSON saja (tanpa komentar, tanpa markdown):
       usage: user.usage_today, limit, remaining: limit - user.usage_today
     });
   } catch (e) {
+    pairLock[sym] = false; // selalu unlock meski error
     console.error('/bot/signal error:', e.message);
-    res.json({ ok: false, error: 'Gagal ambil sinyal: ' + e.message });
+    res.json({ ok: false, status: 'GPT_FAILED', error: 'Gagal ambil sinyal: ' + e.message });
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────────
+// MOMENTUM PLAN — satu GPT call untuk 2 jam signal plan [v6.0]
+// ─────────────────────────────────────────────────────────────────
+const momentumPlans = {}; // key = 'sym|trend', value = { plan, ts }
+const momentumLock  = {}; // anti-overlap per pair
+
+app.post('/bot/momentum-plan', async (req, res) => {
+  try {
+    const { token, pair, trend, interval_minutes, duration_hours } = req.body;
+    if (!token) return res.json({ ok: false, error: 'Token tidak ada' });
+
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch(e) { return res.json({ ok: false, error: 'Token tidak valid atau expired' }); }
+
+    const user = users[decoded.username];
+    if (!user || !user.is_active) return res.json({ ok: false, error: 'Akun tidak aktif' });
+
+    resetIfNewDay(user);
+    const limit = PLAN_LIMIT[user.plan] || 5;
+    if (user.usage_today >= limit) {
+      return res.json({ ok: false, error: `Limit harian habis! (${user.usage_today}/${limit}).`, usage: user.usage_today, limit });
+    }
+
+    // Market closed check
+    if (!isForexMarketOpen()) {
+      return res.json({ ok: false, status: 'SKIP_MARKET_CLOSED', error: 'MARKET CLOSED — Forex tutup akhir pekan' });
+    }
+
+    const sym      = pair || 'EUR/USD';
+    const trendDir = (trend === 'UP' || trend === 'DOWN') ? trend : 'UP';
+    const interval = parseInt(interval_minutes) || 5;
+    const durationH = parseFloat(duration_hours) || 2;
+    const planKey  = sym + '|' + trendDir;
+
+    // Anti-overlap
+    if (momentumLock[planKey]) {
+      return res.json({ ok: false, status: 'SKIP_GPT_IN_PROGRESS', error: 'Momentum plan sedang dibuat untuk pair ini' });
+    }
+    momentumLock[planKey] = true;
+
+    const https = require('https');
+    function fetchCandle(iv, size) {
+      return new Promise((resolve, reject) => {
+        const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${iv}&outputsize=${size}&apikey=${TWELVE_KEY}`;
+        https.get(url, (r) => {
+          let data = '';
+          r.on('data', d => data += d);
+          r.on('end', () => {
+            try {
+              const j = JSON.parse(data);
+              if (j.status === 'error') return reject(new Error('TwelveData: ' + j.message));
+              resolve(j.values.map(v => ({ o:parseFloat(v.open),h:parseFloat(v.high),l:parseFloat(v.low),c:parseFloat(v.close) })).reverse());
+            } catch(e) { reject(e); }
+          });
+        }).on('error', reject);
+      });
+    }
+
+    const [c1m, c5m, c15m] = await Promise.all([
+      fetchCandle('1min',15), fetchCandle('5min',15), fetchCandle('15min',15)
+    ]);
+
+    // Generate signal timestamps dalam WIB
+    const now       = new Date();
+    const startMs   = now.getTime() + interval * 60000;
+    const endMs     = now.getTime() + durationH * 3600000;
+    const totalSig  = Math.floor((endMs - startMs) / (interval * 60000)) + 1;
+    const sigTimes  = [];
+    for (let i = 0; i < totalSig; i++) {
+      sigTimes.push(getWIBISOStr(new Date(startMs + i * interval * 60000)));
+    }
+
+    const nowWIBStr = getWIBStr(now);
+    const snapshotRow = (candles, label) => {
+      const last = candles[candles.length - 1];
+      return `${label} last: O:${last.o.toFixed(5)} H:${last.h.toFixed(5)} L:${last.l.toFixed(5)} C:${last.c.toFixed(5)}`;
+    };
+    const snapshot = [snapshotRow(c15m,'15m'), snapshotRow(c5m,'5m'), snapshotRow(c1m,'1m')].join(' | ');
+
+    const prompt = `Kamu AI scalper binary option ${sym}.
+Waktu WIB: ${nowWIBStr} | Trend ditetapkan user: ${trendDir === 'UP' ? 'NAIK (BULLISH)' : 'TURUN (BEARISH)'}
+Snapshot market: ${snapshot}
+
+Buat signal plan ${durationH} jam dengan interval ${interval} menit.
+Karena trend ${trendDir}, mayoritas signal harus ${trendDir === 'UP' ? 'BUY' : 'SELL'}. Boleh HOLD jika area kurang ideal.
+Timestamp WIB yang harus diisi (TEPAT ${totalSig} signal): ${sigTimes.join(', ')}
+
+JAWAB JSON saja:
+{"strategy":"MOMENTUM","pair":"${sym}","trend":"${trendDir}","generated_at":"${getWIBISOStr(now)}","valid_from":"${sigTimes[0]}","valid_until":"${sigTimes[sigTimes.length-1]}","timezone":"Asia/Jakarta","interval_minutes":${interval},"signals":[{"time":"${sigTimes[0]}","action":"BUY"}]}`;
+
+    const gptResult = await new Promise((resolve, reject) => {
+      const body = JSON.stringify({ model: OPENAI_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 1800, temperature: 0.3 });
+      const urlObj = new URL(OPENAI_URL);
+      const opts = {
+        hostname: urlObj.hostname, path: urlObj.pathname, method: 'POST',
+        headers: { 'Content-Type':'application/json', 'Authorization':`Bearer ${OPENAI_KEY}`, 'Content-Length': Buffer.byteLength(body) },
+        timeout: 25000
+      };
+      const req2 = https.request(opts, (r) => {
+        let d = '';
+        r.on('data', c => d += c);
+        r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+      });
+      req2.on('error', reject);
+      req2.on('timeout', () => reject(new Error('GPT momentum timeout')));
+      req2.write(body); req2.end();
+    });
+
+    const raw  = gptResult.choices[0].message.content.trim().replace(/\`\`\`json|\`\`\`/g, '').trim();
+    const plan = JSON.parse(raw);
+
+    // Validasi output
+    if (!plan || plan.strategy !== 'MOMENTUM' || !Array.isArray(plan.signals) || plan.signals.length < 1) {
+      momentumLock[planKey] = false;
+      return res.json({ ok: false, status: 'GPT_FAILED', error: 'Output GPT tidak valid atau tidak sesuai format' });
+    }
+    const validActions = ['BUY','SELL','HOLD'];
+    for (const sig of plan.signals) {
+      if (!sig.time || !validActions.includes(sig.action)) {
+        momentumLock[planKey] = false;
+        return res.json({ ok: false, status: 'GPT_FAILED', error: 'Signal dalam plan tidak valid: ' + JSON.stringify(sig) });
+      }
+    }
+
+    // Simpan plan
+    momentumPlans[planKey] = { plan, ts: Date.now() };
+
+    // [v6.0] Usage hanya naik jika ada BUY/SELL dalam plan (bukan semua HOLD)
+    const hasActionable = plan.signals.some(s => s.action === 'BUY' || s.action === 'SELL');
+    if (hasActionable) {
+      user.usage_today++;
+      console.log(`[Momentum] ${decoded.username} plan generated ${sym} trend=${trendDir} → usage ${user.usage_today}/${limit}`);
+    } else {
+      console.log(`[Momentum] ${decoded.username} plan all-HOLD, usage tidak naik`);
+    }
+
+    momentumLock[planKey] = false;
+    res.json({ ok: true, plan, usage: user.usage_today, limit, remaining: limit - user.usage_today });
+  } catch (e) {
+    const key = (req.body.pair || 'EUR/USD') + '|' + (req.body.trend || 'UP');
+    momentumLock[key] = false;
+    console.error('/bot/momentum-plan error:', e.message);
+    res.json({ ok: false, status: 'GPT_FAILED', error: 'Gagal generate plan: ' + e.message });
   }
 });
 
