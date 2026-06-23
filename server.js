@@ -391,13 +391,18 @@ app.post('/bot/momentum-plan', async (req, res) => {
     ]);
 
     // Generate signal timestamps dalam WIB
-    const now       = new Date();
-    const startMs   = now.getTime() + interval * 60000;
-    const endMs     = now.getTime() + durationH * 3600000;
-    const totalSig  = Math.floor((endMs - startMs) / (interval * 60000)) + 1;
+    const now            = new Date();
+    // [v6.3.2-FIX] Snap startMs ke kelipatan interval menit berikutnya dari epoch
+    // (UTC epoch habis dibagi 5 menit = WIB juga habis dibagi 5, karena 7*60/5=84 bulat)
+    // Sehingga signal selalu jatuh di menit kelipatan 5: :00, :05, :10, :15, ..., :55
+    const msPerInterval  = interval * 60000;
+    const startMs_raw    = now.getTime() + interval * 60000;
+    const startMs        = Math.ceil(startMs_raw / msPerInterval) * msPerInterval;
+    const endMs          = now.getTime() + durationH * 3600000;
+    const totalSig       = Math.max(1, Math.floor((endMs - startMs) / msPerInterval) + 1);
     const sigTimes  = [];
     for (let i = 0; i < totalSig; i++) {
-      sigTimes.push(getWIBISOStr(new Date(startMs + i * interval * 60000)));
+      sigTimes.push(getWIBISOStr(new Date(startMs + i * msPerInterval)));
     }
 
     const nowWIBStr = getWIBStr(now);
@@ -433,7 +438,8 @@ Format JSON (ikuti struktur ini persis, isi SEMUA ${totalSig} signal, satu baris
       const opts = {
         hostname: urlObj.hostname, path: urlObj.pathname, method: 'POST',
         headers: { 'Content-Type':'application/json', 'Authorization':`Bearer ${OPENAI_KEY}`, 'Content-Length': Buffer.byteLength(body) },
-        timeout: 25000
+        // [v6.3.2-FIX] Naikkan timeout 25s → 45s untuk cegah GPT momentum timeout
+        timeout: 45000
       };
       const req2 = https.request(opts, (r) => {
         let d = '';
@@ -441,7 +447,8 @@ Format JSON (ikuti struktur ini persis, isi SEMUA ${totalSig} signal, satu baris
         r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
       });
       req2.on('error', reject);
-      req2.on('timeout', () => reject(new Error('GPT momentum timeout')));
+      // [v6.3.2-FIX] destroy() wajib dipanggil agar socket tidak leak saat timeout
+      req2.on('timeout', () => { req2.destroy(); reject(new Error('GPT momentum timeout')); });
       req2.write(body); req2.end();
     });
 
