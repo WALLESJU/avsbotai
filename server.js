@@ -181,7 +181,7 @@ app.post('/bot/signal', async (req, res) => {
     if (boxFresh(sym)) {
       const cached = pairBox[sym];
       const ageS   = Math.round((Date.now() - cached.ts) / 1000);
-      // [v6.0] Usage hanya naik jika signal BUY/SELL, bukan SKIP
+      // Usage hanya naik jika signal BUY/SELL, bukan HOLD
       const sig = cached.data.signal;
       if (sig === 'BUY' || sig === 'SELL') user.usage_today++;
       return res.json({
@@ -246,19 +246,45 @@ app.post('/bot/signal', async (req, res) => {
     }
 
     const now       = new Date();
-    const target    = new Date(now.getTime() + EXPMIN * 60 * 1000);
-    // [v6.0] Expiry dalam WIB (Asia/Jakarta), bukan UTC server
+    // [GPT-Strategi] Expiry FIXED 2 menit dari sekarang (bukan dari EXPMIN)
+    const target    = new Date(now.getTime() + 2 * 60 * 1000);
     const expiryStr = getWIBStr(target);
     const nowWIBStr = getWIBStr(now);
     const data      = fmtC(c15m, 'TF 15m') + fmtC(c5m, 'TF 5m') + fmtC(c1m, 'TF 1m');
 
-    const prompt = `Kamu AI scalper profesional binary option ${sym}.
-REAL data: ${nowWIBStr} WIB | Expiry range: ${EXPMIN}–30 menit
+    // ── STRATEGI GPT: Candle Merah & Hijau, S/R Body, Informasi, Konfirmasi ──
+    const prompt = `Kamu AI analyst binary option ${sym}. Waktu: ${nowWIBStr} WIB.
+Strategi: HANYA membaca candle MERAH (C<O = seller) dan HIJAU (C>O = buyer). Abaikan konsep lain.
+
+DEFINISI SUPPORT & RESISTANCE (dari BODY candle saja, abaikan sumbu/wick):
+- SUPPORT    = level di mana close candle MERAH bertemu open candle HIJAU berikutnya
+- RESISTANCE = level di mana close candle HIJAU bertemu open candle MERAH berikutnya
+
+ATURAN INFORMASI candle (baca sumbu, bukan warna):
+- Candle HIJAU (C>O): sumbu atas [H-C] LEBIH PANJANG dari sumbu bawah [O-L] → informasi NAIK
+- Candle HIJAU (C>O): sumbu bawah [O-L] LEBIH PANJANG dari sumbu atas [H-C] → informasi TURUN
+- Candle MERAH (C<O): sumbu atas [H-O] LEBIH PENDEK dari sumbu bawah [C-L]  → informasi NAIK
+- Candle MERAH (C<O): sumbu atas [H-O] LEBIH PANJANG dari sumbu bawah [C-L] → informasi TURUN
+- Jika sumbu hampir sama → informasi TIDAK_JELAS
+
+ATURAN KONFIRMASI:
+- Candle SETELAH candle informasi harus searah. Contoh: info NAIK → candle konfirmasi harus HIJAU.
+- Jika candle konfirmasi berlawanan arah → belum terkonfirmasi → HOLD
+
+SYARAT ENTRY (SEMUA harus terpenuhi untuk memberi BUY atau SELL):
+1. Ada candle informasi yang jelas (sumbu tidak equal)
+2. Ada candle konfirmasi searah
+3. Trend TF 1m, 5m, DAN 15m semuanya mendukung arah yang SAMA
+4. Posisi harga jelas (menuju resistance untuk BUY, menuju support untuk SELL)
+Jika SATU SAJA syarat tidak terpenuhi → wajib HOLD
+
+EXPIRY: TETAP ${expiryStr} WIB (2 menit dari sekarang, tidak boleh diubah)
+
+Data candle ${sym} (candle terbaru = nomor terbesar per TF):
 ${data}
-Analisa 3TF mendalam: trend structure, smart money concept, supply demand zone, momentum.
-Hanya beri BUY/SELL jika setup jelas dan tervalidasi. Beri SKIP jika market ragu/sideways.
-JAWAB JSON saja (tanpa komentar, tanpa markdown):
-{"signal":"BUY|SELL|SKIP","confidence":75,"trend15m":"BULLISH|BEARISH|SIDEWAYS","trend5m":"BULLISH|BEARISH|SIDEWAYS","smartmoney":true,"biasStrength":"STRONG|MODERATE|WEAK","srLevels":{"s1":1.15720,"s2":1.15680,"r1":1.15820,"r2":1.15880},"reasonopen":"max 100 char","reasonexpiry":"max 80 char","entryprice":1.15780,"expiry":"${expiryStr}"}`;
+
+BALAS JSON satu baris saja, tanpa markdown, tanpa komentar:
+{"signal":"BUY|SELL|HOLD","confidence":0-100,"trend1m":"BULLISH|BEARISH|SIDEWAYS","trend5m":"BULLISH|BEARISH|SIDEWAYS","trend15m":"BULLISH|BEARISH|SIDEWAYS","srLevels":{"support":0.00000,"resistance":0.00000},"informasi":"NAIK|TURUN|TIDAK_JELAS","konfirmasi":true,"reasonopen":"max 100 char","expiry":"${expiryStr}"}`;
 
     // Call GPT (native https, tanpa axios)
     const gptResult = await new Promise((resolve, reject) => {
@@ -300,13 +326,13 @@ JAWAB JSON saja (tanpa komentar, tanpa markdown):
     pairBox[sym] = { ts: Date.now(), data: gpt, candles_1m: candles1mBox };
     console.log(`[PairBox] ${sym} rebuilt — signal:${gpt.signal} conf:${gpt.confidence}% expiry:${expiryStr} WIB`);
 
-    // [v6.0] Usage hanya naik jika BUY/SELL — SKIP tidak mengurangi kuota
+    // Usage hanya naik jika BUY/SELL — HOLD tidak mengurangi kuota
     const finalSig = gpt.signal;
     if (finalSig === 'BUY' || finalSig === 'SELL') {
       user.usage_today++;
-      console.log(`[Usage] ${decoded.username} → ${user.usage_today}/${limit} (GPT_PLAN_GENERATED signal=${finalSig})`);
+      console.log(`[Usage] ${decoded.username} → ${user.usage_today}/${limit} (GPT signal=${finalSig})`);
     } else {
-      console.log(`[Usage] ${decoded.username} → unchanged (SKIP_NO_SIGNAL)`);
+      console.log(`[Usage] ${decoded.username} → unchanged (HOLD_NO_SIGNAL)`);
     }
 
     pairLock[sym] = false;
@@ -324,6 +350,189 @@ JAWAB JSON saja (tanpa komentar, tanpa markdown):
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────
+// SNR SIGNAL — rule-based (tanpa GPT call), scalping cepat
+// Support = close candle merah bertemu open candle hijau (body)
+// Resistance = close candle hijau bertemu open candle merah (body)
+// ─────────────────────────────────────────────────────────────────
+
+// SNR Box Cache — TTL 60 detik (lebih cepat dari GPT 3 menit)
+const snrBox = {};
+const SNR_TTL = 60 * 1000;
+function snrBoxFresh(sym) {
+  const b = snrBox[sym];
+  return b && (Date.now() - b.ts) < SNR_TTL;
+}
+const snrLock = {};
+
+// Analisa candle murni (rule-based) untuk strategi SNR
+function analyzeSNR(c1m, c5m) {
+  const isGreen  = c => c.c > c.o;
+  const isRed    = c => c.c < c.o;
+  const upperW   = c => c.h - Math.max(c.o, c.c); // sumbu atas
+  const lowerW   = c => Math.min(c.o, c.c) - c.l; // sumbu bawah
+
+  const last1m   = c1m.slice(-10);
+  const last5m   = c5m.slice(-5);
+  const cur      = last1m[last1m.length - 1]; // candle konfirmasi (terbaru)
+  const prev     = last1m[last1m.length - 2]; // candle informasi
+
+  // ── Cari Support & Resistance dari body candle (1m) ──
+  let support = null, resistance = null;
+  for (let i = 0; i < last1m.length - 1; i++) {
+    const a = last1m[i], b = last1m[i + 1];
+    // Support: close merah ↔ open hijau
+    if (isRed(a) && isGreen(b)) {
+      const lvl = (a.c + b.o) / 2;
+      if (support === null || Math.abs(lvl - cur.c) < Math.abs(support - cur.c)) support = lvl;
+    }
+    // Resistance: close hijau ↔ open merah
+    if (isGreen(a) && isRed(b)) {
+      const lvl = (a.c + b.o) / 2;
+      if (resistance === null || Math.abs(lvl - cur.c) < Math.abs(resistance - cur.c)) resistance = lvl;
+    }
+  }
+
+  // ── Informasi dari candle sebelum terakhir ──
+  let info = 'TIDAK_JELAS';
+  const pU = upperW(prev), pL = lowerW(prev);
+  if (Math.abs(pU - pL) > 0.00002) { // ada perbedaan nyata (min 0.2 pip)
+    if (isGreen(prev)) info = pU > pL ? 'NAIK' : 'TURUN';
+    else               info = pU < pL ? 'NAIK' : 'TURUN';
+  }
+
+  // ── Konfirmasi dari candle terbaru ──
+  const confirmed = (info === 'NAIK' && isGreen(cur)) || (info === 'TURUN' && isRed(cur));
+
+  // ── Trend 5m (mayoritas warna) ──
+  const g5 = last5m.filter(isGreen).length;
+  const r5 = last5m.filter(isRed).length;
+  const trend5m = g5 > r5 ? 'UP' : (r5 > g5 ? 'DOWN' : 'SIDEWAYS');
+
+  // ── Trend 1m (3 candle terakhir) ──
+  const last3 = last1m.slice(-3);
+  const g1 = last3.filter(isGreen).length;
+  const trend1m = g1 >= 2 ? 'UP' : (g1 === 0 ? 'DOWN' : 'SIDEWAYS');
+
+  const curPrice = cur.c;
+
+  // ── Signal SNR (lebih longgar dari GPT untuk scalping) ──
+  // Cukup salah satu dari trend1m ATAU trend5m mendukung (tidak perlu keduanya)
+  let signal = 'HOLD', reason = '';
+  if (info !== 'TIDAK_JELAS' && confirmed) {
+    if (info === 'NAIK' && (trend1m === 'UP' || trend5m === 'UP')) {
+      if (!resistance || curPrice < resistance * 1.00005) {
+        signal = 'BUY';
+        reason = 'Info naik, konfirmasi hijau, trend mendukung naik, menuju resistance';
+      } else { reason = 'Info naik tapi harga sudah di resistance — HOLD'; }
+    } else if (info === 'TURUN' && (trend1m === 'DOWN' || trend5m === 'DOWN')) {
+      if (!support || curPrice > support * 0.99995) {
+        signal = 'SELL';
+        reason = 'Info turun, konfirmasi merah, trend mendukung turun, menuju support';
+      } else { reason = 'Info turun tapi harga sudah di support — HOLD'; }
+    } else {
+      reason = 'Info + konfirmasi ada tapi trend berlawanan — HOLD';
+    }
+  } else if (info === 'TIDAK_JELAS') {
+    reason = 'Informasi candle tidak jelas (sumbu hampir sama)';
+  } else {
+    reason = 'Konfirmasi belum ada (candle berlawanan dengan informasi)';
+  }
+
+  return {
+    signal, support, resistance,
+    informasi: info, konfirmasi: confirmed,
+    trend1m, trend5m,
+    reason, currentPrice: curPrice
+  };
+}
+
+app.post('/bot/snr-signal', async (req, res) => {
+  try {
+    const { token, symbol } = req.body;
+    if (!token) return res.json({ ok: false, error: 'Token tidak ada' });
+
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch(e) { return res.json({ ok: false, error: 'Token tidak valid atau expired' }); }
+
+    const user = users[decoded.username];
+    if (!user || !user.is_active) return res.json({ ok: false, error: 'Akun tidak aktif' });
+
+    if (!isForexMarketOpen()) {
+      return res.json({ ok: false, status: 'SKIP_MARKET_CLOSED', error: 'MARKET CLOSED — Forex tutup akhir pekan' });
+    }
+
+    const sym = symbol || 'EUR/USD';
+
+    // Serve dari cache jika masih fresh (60 detik)
+    if (snrBoxFresh(sym)) {
+      const cached = snrBox[sym];
+      const ageS   = Math.round((Date.now() - cached.ts) / 1000);
+      return res.json({ ok: true, signal: cached.data, candles_1m: cached.candles_1m, source: 'cache', box_age_sec: ageS });
+    }
+
+    if (snrLock[sym]) {
+      return res.json({ ok: false, status: 'SKIP_IN_PROGRESS', error: 'SNR analisa sedang berjalan, coba lagi sebentar' });
+    }
+    snrLock[sym] = true;
+
+    if (!TWELVE_KEY) {
+      snrLock[sym] = false;
+      return res.json({ ok: false, error: 'Server belum dikonfigurasi (TWELVE_KEY kosong)' });
+    }
+
+    const https = require('https');
+    function fetchCandle(interval, size) {
+      return new Promise((resolve, reject) => {
+        const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${interval}&outputsize=${size}&apikey=${TWELVE_KEY}`;
+        https.get(url, (r) => {
+          let data = '';
+          r.on('data', d => data += d);
+          r.on('end', () => {
+            try {
+              const json = JSON.parse(data);
+              if (json.status === 'error') return reject(new Error('TwelveData: ' + json.message));
+              const candles = json.values.map(v => ({
+                o: parseFloat(v.open), h: parseFloat(v.high),
+                l: parseFloat(v.low),  c: parseFloat(v.close)
+              })).reverse();
+              resolve(candles);
+            } catch(e) { reject(e); }
+          });
+        }).on('error', reject);
+      });
+    }
+
+    const [c1m, c5m] = await Promise.all([
+      fetchCandle('1min', 15),
+      fetchCandle('5min', 10)
+    ]);
+
+    // Rule-based SNR analysis (no GPT)
+    const result = analyzeSNR(c1m, c5m);
+
+    // Expiry: 2 menit dari sekarang
+    const now      = new Date();
+    const expTgt   = new Date(now.getTime() + 2 * 60 * 1000);
+    result.expiry  = getWIBStr(expTgt);
+
+    const candles1mBox = c1m.slice(-5);
+    snrBox[sym] = { ts: Date.now(), data: result, candles_1m: candles1mBox };
+    console.log(`[SNR] ${sym} rebuilt — signal:${result.signal} info:${result.informasi} conf:${result.konfirmasi}`);
+
+    // SNR tidak mengurangi usage quota (tidak ada GPT call)
+    snrLock[sym] = false;
+    res.json({ ok: true, signal: result, candles_1m: candles1mBox, source: 'fresh' });
+
+  } catch(e) {
+    const sym = req.body.symbol || 'EUR/USD';
+    snrLock[sym] = false;
+    console.error('/bot/snr-signal error:', e.message);
+    res.json({ ok: false, error: 'Gagal analisa SNR: ' + e.message });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────
 // MOMENTUM PLAN — satu GPT call untuk 2 jam signal plan [v6.0]
